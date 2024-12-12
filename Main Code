@@ -1,0 +1,177 @@
+clc;
+clear;
+
+% Load pre-trained face detection model
+faceDetector = vision.CascadeObjectDetector('FrontalFaceCART', 'MinSize', [100, 100]);
+
+% Directory for face database
+databasePath = 'FaceDatabase/';
+if ~isfolder(databasePath)
+    mkdir(databasePath);
+end
+
+% Attendance log file
+attendanceFile = 'AttendanceLog.xlsx';
+
+% Initialize attendance file if it doesn't exist
+if ~exist(attendanceFile, 'file')
+    headers = {'Name', 'Date', 'Time'};
+    writecell(headers, attendanceFile);
+end
+
+% Menu options
+disp('1. Register New Face');
+disp('2. Recognize and Mark Attendance');
+choice = input('Enter your choice (1 or 2): ');
+
+switch choice
+    case 1
+        %% Register New Face
+        personName = input('Enter the person''s name: ', 's');
+
+        % Check if the person is already registered
+        personDir = fullfile(databasePath, personName);
+        if isfolder(personDir)
+            disp('Face already registered.');
+            return;
+        end
+
+        webcamObj = webcam;
+        disp('Capturing images for registration...');
+        pause(1);
+
+        mkdir(personDir); % Create directory for this person
+
+        % Capture 50 images for better registration
+        for i = 1:50
+            img = snapshot(webcamObj);
+            bbox = step(faceDetector, img);
+            if ~isempty(bbox)
+                % Crop and save face
+                faceImg = imcrop(img, bbox(1, :));
+                faceImg = imresize(faceImg, [224, 224]); % Resize
+                fileName = fullfile(personDir, sprintf('face_%d.jpg', i));
+                imwrite(faceImg, fileName);
+                disp(['Captured image ', num2str(i), ' of 50']);
+            else
+                disp('No face detected. Retrying...');
+            end
+        end
+
+        clear webcamObj;
+        disp('Registration completed successfully!');
+
+    case 2
+        %% Recognize and Mark Attendance (One-Time)
+        if isempty(dir(fullfile(databasePath, '*')))
+            disp('No registered faces found. Please register first.');
+            return; % Exit if no registered faces are found
+        end
+
+        webcamObj = webcam;
+        disp('Starting face recognition...');
+        pause(1);
+
+        % Try to create imageDatastore and handle empty folder case
+        try
+            registeredFaces = imageDatastore(databasePath, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+            if isempty(registeredFaces.Files)
+                disp('No registered faces found. Please register first.');
+                clear webcamObj; % Ensure webcam is cleared if no registration
+                return;
+            end
+            
+            [faceFeatures, faceLabels] = prepareFeatures(registeredFaces);
+
+            % Capture an image from the webcam
+            img = snapshot(webcamObj);
+            bbox = step(faceDetector, img);
+
+            if ~isempty(bbox)
+                recognized = false; % Flag to track if a face is recognized
+                
+                for i = 1:size(bbox, 1)
+                    % Crop and preprocess face
+                    try
+                        faceImg = imcrop(img, bbox(i, :));
+                        if isempty(faceImg) || numel(size(faceImg)) < 2
+                            disp('Error: Invalid face crop detected.');
+                            continue;
+                        end
+
+                        faceImg = imresize(faceImg, [224, 224]); % Resize
+                        faceImg = double(faceImg) / 255; % Normalize
+
+                        % Extract features
+                        queryFeatures = extractLBPFeatures(rgb2gray(faceImg));
+
+                        % Custom Euclidean distance calculation
+                        distances = customEuclideanDistance(queryFeatures, faceFeatures);
+                        [minDist, idx] = min(distances);
+
+                        % Define threshold for recognition (0.3 can be adjusted based on accuracy needs)
+                        threshold = 0.3; 
+                        if minDist < threshold
+                            personName = char(faceLabels(idx));
+                            disp(['Recognized: ', personName]);
+
+                            % Mark attendance
+                            timestamp = datetime('now');
+                            attendanceData = {personName, datestr(timestamp, 'yyyy-mm-dd'), datestr(timestamp, 'HH:MM:SS')};
+                            writecell(attendanceData, attendanceFile, 'WriteMode', 'append');
+
+                            % Annotate image with recognized name
+                            img = insertObjectAnnotation(img, 'rectangle', bbox(i, :), personName, 'Color', 'green');
+                            recognized = true; % Set flag to true since a match was found
+
+                        end
+
+                    catch ME
+                        disp(['Error processing face: ', ME.message]);
+                    end
+                    
+                end
+                
+                % If no recognition occurred after checking all bounding boxes:
+                if ~recognized 
+                    disp('Unrecognized person.');
+                    img = insertObjectAnnotation(img, 'rectangle', bbox(1,:), 'Unrecognized', 'Color', 'red');
+                end
+                
+                imshow(img); % Show final annotated image after processing all detections
+                
+            else
+                disp('No face detected. Please adjust your position.');
+            end
+            
+        catch ME
+            disp('No registered faces found. Please register first.');
+        end
+
+        clear webcamObj; % Ensure webcam is cleared after processing
+
+end
+
+%% Function to prepare features from the database
+function [features, labels] = prepareFeatures(faceDatastore)
+    numImages = numel(faceDatastore.Files);
+    features = [];
+    labels = [];
+    for i = 1:numImages
+        img = readimage(faceDatastore, i);
+        img = imresize(img, [224, 224]); % Resize for consistency
+        img = double(img) / 255; % Normalize
+        imgFeatures = extractLBPFeatures(rgb2gray(img)); % Extract LBP features
+        features = [features; imgFeatures]; %#ok<AGROW>
+        labels = [labels; faceDatastore.Labels(i)];
+    end
+end
+
+%% Custom Euclidean Distance Function
+function distances = customEuclideanDistance(queryFeature, databaseFeatures)
+    numFeatures = size(databaseFeatures, 1);
+    distances = zeros(numFeatures, 1);
+    for i = 1:numFeatures
+        distances(i) = sqrt(sum((queryFeature - databaseFeatures(i, :)).^2));
+    end
+end
